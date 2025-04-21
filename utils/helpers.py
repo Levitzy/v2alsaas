@@ -316,6 +316,10 @@ def extract_error_message(html):
         r'errorBanner["\']>(.*?)</div>',
         r'errorContainer["\']>(.*?)</div>',
         r'"errorCode":(\d+),"errorMessage":"([^"]+)"',
+        # Facebook mobile error formats
+        r"<title>Error</title>",
+        r"<h1>Error</h1>\s*<p>([^<]+)</p>",
+        r'<div id="error">([^<]+)</div>',
     ]
 
     for pattern in error_patterns:
@@ -362,8 +366,10 @@ def extract_error_message(html):
         "too many accounts",
         "security checkpoint",
         "verification required",
-        "robot check",
-        "bot detection",
+        "too many registration attempts",
+        "create accounts too quickly",
+        "security restrictions",
+        "blocked",
     ]
 
     for phrase in common_errors:
@@ -377,6 +383,10 @@ def extract_error_message(html):
     general_message = re.search(r"<div[^>]*message[^>]*>([^<]+)</div>", html)
     if general_message:
         return general_message.group(1).strip()
+
+    # Check for Facebook's generic error title
+    if "<title>Error</title>" in html:
+        return "Facebook returned an error page"
 
     return "Unknown error occurred"
 
@@ -729,17 +739,18 @@ def handle_between_attempts(attempt, max_attempts):
 
 
 def extract_user_id(response, session):
-    """Extract user ID from response or cookies (updated for 2025 Facebook)"""
+    """Extract user ID from response or cookies with improved detection for 2025 Facebook"""
     user_id = "Unknown"
 
     # Check cookies first (most reliable)
     cookies = session.cookies.get_dict()
     if "c_user" in cookies:
         user_id = cookies.get("c_user")
-        info(f"[*] Extracted user ID from cookies: {user_id}")
-        return user_id
+        if user_id and user_id != "0":
+            info(f"[*] Extracted user ID from cookies: {user_id}")
+            return user_id
 
-    # Try to extract from URL
+    # Try to extract from URL parameters
     url = response.url
     id_patterns = [
         r"id=(\d+)",
@@ -759,13 +770,16 @@ def extract_user_id(response, session):
     for pattern in id_patterns:
         match = re.search(pattern, url)
         if match:
-            user_id = match.group(1)
-            info(f"[*] Extracted user ID from URL: {user_id}")
-            return user_id
+            potential_id = match.group(1)
+            if potential_id and potential_id != "0" and len(potential_id) > 5:
+                user_id = potential_id
+                info(f"[*] Extracted user ID from URL: {user_id}")
+                return user_id
 
-    # Try to extract from HTML content
+    # Try to extract from HTML content with more aggressive pattern matching
     html = response.text
     html_patterns = [
+        # Standard patterns
         r'"userID":"(\d+)"',
         r'"user_id":"(\d+)"',
         r'"userId":"(\d+)"',
@@ -776,7 +790,7 @@ def extract_user_id(response, session):
         r'"profile_id":"(\d+)"',
         r'"id":"(\d+)"[^}]*"type":"User"',
         r'entity_id":"(\d+)"',
-        # New 2025 patterns
+        # 2025 patterns
         r'"subject_id":"(\d+)"',
         r'"ownerId":"(\d+)"',
         r'"accountId":"(\d+)"',
@@ -784,54 +798,108 @@ def extract_user_id(response, session):
         r'"profileOwner":{"id":"(\d+)"',
         r'"registeredUser":{"id":"(\d+)"',
         r'"viewerId":"(\d+)"',
+        # More aggressive patterns
+        r'"id":"(\d{8,})"',  # Look for IDs with at least 8 digits
+        r"id=(\d{8,})",  # Another common format
+        r"profile\.php\?id=(\d{8,})",  # Profile URL format
+        r"userid=(\d{8,})",
+        r'"USER_ID":"(\d{8,})"',
+        r'userid":"(\d{8,})"',
+        r"fb://profile/(\d+)",  # Mobile app deep link
+        r"member_id=(\d+)",  # Group membership
+        r"source_id=(\d+)",
+        r"owner_id=(\d+)",
+        # Look for user ID in script tags
+        r'requireLazy\(.*?"user".*?"(\d{8,})"',
+        r'require\("CurrentUserInitialData"\).*?"(\d{8,})"',
+        r'BootloaderConfig.*?{"r":.*?(\d{8,})',
+        r'window\.userID="(\d+)"',
+        r'window\.USER_ID="(\d+)"',
+        # Look for user ID in comments and meta tags
+        r"<!-- userid:(\d+) -->",
+        r'<meta property="al:android:url" content="fb://profile/(\d+)"',
     ]
 
     for pattern in html_patterns:
         match = re.search(pattern, html)
         if match:
-            user_id = match.group(1)
-            info(f"[*] Extracted user ID from HTML: {user_id}")
-            return user_id
+            potential_id = match.group(1)
+            if potential_id and potential_id != "0" and len(potential_id) > 5:
+                user_id = potential_id
+                info(f"[*] Extracted user ID from HTML: {user_id}")
+                return user_id
 
-    # Try to extract from JSON data if present
+    # Advanced JSON extraction with better depth handling
     try:
-        json_data = json.loads(html)
-        if isinstance(json_data, dict):
-            # Check various JSON structures used by Facebook
-            json_paths = [
-                ["data", "user", "id"],
-                ["data", "viewer", "id"],
-                ["data", "account", "id"],
-                ["data", "profile", "id"],
-                ["data", "registration", "userID"],
-                ["data", "mobileRegistration", "userID"],
-                ["user", "id"],
-                ["viewer", "id"],
-                ["registration", "userID"],
-                ["userInfo", "id"],
-            ]
+        # Find all JSON objects in script tags
+        json_objects = re.findall(
+            r"<script[^>]*>\s*({.+?})\s*</script>", html, re.DOTALL
+        )
+        json_objects += re.findall(
+            r'(?:__d|requireLazy|require)\([^{]+({"[^}]+})[,)]', html
+        )
 
-            for path in json_paths:
-                current = json_data
-                valid_path = True
+        for json_str in json_objects:
+            try:
+                # Clean up the JSON string
+                json_str = re.sub(r'\\["]', '"', json_str)
+                if json_str:
+                    json_data = json.loads(json_str)
 
-                for key in path:
-                    if isinstance(current, dict) and key in current:
-                        current = current[key]
-                    else:
-                        valid_path = False
-                        break
+                    # Function to recursively search for user IDs in JSON
+                    def search_json_for_id(data, current_path=""):
+                        if isinstance(data, dict):
+                            # Check known key patterns for user IDs
+                            id_keys = [
+                                "user_id",
+                                "userID",
+                                "userId",
+                                "id",
+                                "actorID",
+                                "uid",
+                                "profileID",
+                                "viewerID",
+                            ]
+                            for key, value in data.items():
+                                # Check if this key looks like a user ID field
+                                if (
+                                    key in id_keys
+                                    or "user" in key.lower()
+                                    and "id" in key.lower()
+                                ):
+                                    if (
+                                        isinstance(value, (str, int))
+                                        and str(value).isdigit()
+                                        and str(value) != "0"
+                                        and len(str(value)) > 5
+                                    ):
+                                        return str(value)
 
-                if (
-                    valid_path
-                    and isinstance(current, (str, int))
-                    and str(current).isdigit()
-                ):
-                    user_id = str(current)
-                    info(
-                        f"[*] Extracted user ID from JSON path {'.'.join(path)}: {user_id}"
-                    )
-                    return user_id
+                                # Recurse into nested objects/arrays
+                                result = search_json_for_id(
+                                    value,
+                                    f"{current_path}.{key}" if current_path else key,
+                                )
+                                if result:
+                                    return result
+                        elif isinstance(data, list):
+                            for i, item in enumerate(data):
+                                result = search_json_for_id(
+                                    item, f"{current_path}[{i}]"
+                                )
+                                if result:
+                                    return result
+                        return None
+
+                    # Search the JSON for user ID
+                    found_id = search_json_for_id(json_data)
+                    if found_id:
+                        user_id = found_id
+                        info(f"[*] Extracted user ID from JSON: {user_id}")
+                        return user_id
+            except:
+                # Skip invalid JSON
+                continue
     except:
         pass
 
@@ -849,20 +917,25 @@ def extract_user_id(response, session):
                 encoded_id = match.group(1)
                 # Try to decode as base64
                 decoded_id = base64.b64decode(encoded_id).decode("utf-8")
-                if re.match(r"^\d+$", decoded_id):
+                if (
+                    re.match(r"^\d+$", decoded_id)
+                    and decoded_id != "0"
+                    and len(decoded_id) > 5
+                ):
                     user_id = decoded_id
                     info(f"[*] Extracted user ID from encoded data: {user_id}")
                     return user_id
             except:
                 continue
 
-    # If all else fails, generate a placeholder ID
-    if user_id == "Unknown":
-        placeholder_id = f"FB{hashlib.md5(str(uuid.uuid4()).encode()).hexdigest()[:10]}"
-        info(f"[*] Using placeholder user ID: {placeholder_id}")
-        return placeholder_id
+    # If all methods failed and we have a numeric ID that's not 0, use it
+    if user_id.isdigit() and user_id != "0" and len(user_id) > 5:
+        info(f"[*] Using extracted user ID: {user_id}")
+        return user_id
 
-    return user_id
+    # If no valid ID found, use a placeholder
+    info(f"[*] No valid Facebook user ID found")
+    return "Unknown"
 
 
 def generate_browser_fingerprint():
@@ -950,6 +1023,8 @@ def generate_browser_fingerprint():
 
     # Return the fingerprint data
     return {
+        # Add platform at the top level to fix the error
+        "platform": platform,
         "browser": {
             "name": browser,
             "version": browser_version,

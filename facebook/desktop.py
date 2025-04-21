@@ -8,7 +8,7 @@ import json
 import uuid
 from urllib.parse import urlencode, quote_plus
 
-from utils.colors import error, info, success
+from utils.colors import error, info, success, warn
 from utils.helpers import (
     extract_hidden_fields,
     extract_error_message,
@@ -88,115 +88,53 @@ def register_facebook_desktop(email, user_details, proxies=None):
         info(f"[*] Initial cookies: {initial_cookies}")
 
         # Add realistic delays between requests
-        wait_with_jitter(1.5, 3.0)
+        wait_with_jitter(2.5, 4.0)
 
-        # Step 2: Get the modern signup page - Facebook now uses different signup flows
-        # Try several methods to find the working one
-        signup_methods = [
-            {"url": f"{FB_DESKTOP_URL}/reg/", "desc": "standard registration page"},
-            {"url": f"{FB_DESKTOP_URL}/signup", "desc": "modern signup flow"},
-            {
-                "url": f"{FB_DESKTOP_URL}/reg/spotlight/",
-                "desc": "spotlight registration",
-            },
-            {"url": f"{FB_DESKTOP_URL}/r.php", "desc": "legacy registration endpoint"},
-        ]
+        # Step 2: Access the registration page directly
+        reg_url = f"{FB_DESKTOP_URL}/reg/"
+        info(f"[*] Accessing registration page: {reg_url}")
 
-        signup_response = None
-        signup_url = None
-        successful_method = None
+        # Use the homepage as referrer to look more natural
+        session.headers.update(
+            {"Referer": FB_DESKTOP_URL, "Sec-Fetch-Site": "same-origin"}
+        )
 
-        for method in signup_methods:
-            try:
-                info(f"[*] Trying {method['desc']}: {method['url']}...")
+        reg_response = session.get(reg_url, timeout=TIMEOUT)
 
-                # Use the homepage as referrer to look more natural
-                session.headers.update(
-                    {"Referer": FB_DESKTOP_URL, "Sec-Fetch-Site": "same-origin"}
-                )
+        if reg_response.status_code != 200:
+            error(f"[×] Failed to access registration page: {reg_response.status_code}")
+            return False, None
 
-                method_response = session.get(method["url"], timeout=TIMEOUT)
+        # Get HTML content for parsing
+        html = reg_response.text
 
-                if method_response.status_code == 200:
-                    signup_response = method_response
-                    signup_url = method["url"]
-                    successful_method = method["desc"]
-                    info(f"[*] Successfully accessed {method['desc']}: {method['url']}")
-                    break
-                else:
-                    info(
-                        f"[*] {method['desc']} returned status code: {method_response.status_code}"
-                    )
-            except Exception as e:
-                info(f"[*] Error trying {method['desc']}: {e}")
-                continue
+        # Extract a snippet for debugging
+        debug_snippet = html[:500] + "..." if len(html) > 500 else html
+        debug_snippet = re.sub(r"\s+", " ", debug_snippet)
+        info(f"[*] Page content snippet: {debug_snippet[:150]}...")
 
-        if not signup_response or signup_response.status_code != 200:
-            # Try one more approach - direct API method
-            info(
-                "[*] Standard registration pages failed, trying direct API approach..."
-            )
-            return direct_api_registration(session, email, user_details)
+        # First check if the page has a registration form
+        if "create an account" not in html.lower() and "sign up" not in html.lower():
+            warn("[!] Registration form not detected on the page")
+            return False, None
 
-        # Get the HTML content for parsing
-        html = signup_response.text
-
-        # Report which method worked and extract a snippet
-        info(f"[*] Successfully accessed registration via {successful_method}")
-
-        # DEBUG: Save a small portion of the page to see what we're getting
-        try:
-            debug_snippet = html[:500] + "..." if len(html) > 500 else html
-            debug_snippet = re.sub(r"\s+", " ", debug_snippet)
-            info(f"[*] Page content snippet: {debug_snippet[:150]}...")
-        except Exception as e:
-            info(f"[*] Couldn't extract debug snippet: {e}")
-
-        # Step 3: Identify the form submission URL using multiple methods
-        # Modern Facebook often hides the form submission URL in JavaScript
-
-        # Method 1: Direct form action
-        form_action = re.search(r'<form[^>]*action="([^"]+)"[^>]*method="post"', html)
-
-        # Method 2: JavaScript resource
-        js_action = re.search(r'"submitURI":"([^"]+)"', html)
-
-        # Method 3: Facebook's modern signup handler
-        modern_action = re.search(r'"registrationSubmitURI":"([^"]+)"', html)
-
-        # Method 4: API endpoint
-        api_action = re.search(r'"apiEndpoint":"([^"]+)"', html)
-
-        # Process and select the submission URL
-        if modern_action:
-            submit_url = modern_action.group(1).replace("\\", "")
-            if not submit_url.startswith("http"):
-                submit_url = FB_DESKTOP_URL + submit_url
-            info(f"[*] Found modern registration submission URL: {submit_url}")
-        elif form_action:
-            submit_url = form_action.group(1)
+        # Step 3: Extract the form action URL
+        form_action_match = re.search(
+            r'<form[^>]*action="([^"]+)"[^>]*method="post"', html
+        )
+        if form_action_match:
+            submit_url = form_action_match.group(1)
             if not submit_url.startswith("http"):
                 submit_url = FB_DESKTOP_URL + submit_url
             info(f"[*] Found form submission URL: {submit_url}")
-        elif js_action:
-            submit_url = js_action.group(1).replace("\\", "")
-            if not submit_url.startswith("http"):
-                submit_url = FB_DESKTOP_URL + submit_url
-            info(f"[*] Found JavaScript submission URL: {submit_url}")
-        elif api_action:
-            submit_url = api_action.group(1).replace("\\", "")
-            if not submit_url.startswith("http"):
-                submit_url = FB_DESKTOP_URL + submit_url
-            info(f"[*] Found API submission URL: {submit_url}")
         else:
-            # Default fallback - this is the standard endpoint in 2025
-            submit_url = f"{FB_DESKTOP_URL}/api/graphql/"
-            info(f"[*] Using default 2025 GraphQL submission URL: {submit_url}")
+            # Fallback to static URL - use the reg.php endpoint which is more reliable
+            submit_url = f"{FB_DESKTOP_URL}/reg/submit/"
+            info(f"[*] Using fallback form submission URL: {submit_url}")
 
-        # Extract form data and tokens
+        # Extract hidden fields from the form
         hidden_fields = extract_hidden_fields(html)
 
-        # Show debug info about what fields we found
         if hidden_fields:
             debug_fields = (
                 ", ".join(list(hidden_fields.keys())[:5]) + "..."
@@ -205,83 +143,100 @@ def register_facebook_desktop(email, user_details, proxies=None):
             )
             info(f"[*] Found form fields: {debug_fields}")
         else:
-            info("[*] No hidden fields found using standard methods")
+            # Try direct extraction of specific fields
+            info("[*] No hidden fields found, trying direct extraction...")
 
-            # Try to look for modern Facebook's client-side rendered form data
-            # Facebook has moved more to client-side rendering in 2025
-            modern_form_data = extract_modern_form_data(html)
-            if modern_form_data:
-                hidden_fields = modern_form_data
-                info(f"[*] Extracted modern form data with {len(hidden_fields)} fields")
-            else:
-                info("[*] No modern form data found, trying alternate approach...")
+            # Look for common fields in the HTML
+            hidden_fields = {}
+            field_patterns = [
+                (r'name="jazoest"\s+value="([^"]+)"', "jazoest"),
+                (r'name="lsd"\s+value="([^"]+)"', "lsd"),
+                (r'name="reg_instance"\s+value="([^"]+)"', "reg_instance"),
+                (r'name="phstamp"\s+value="([^"]+)"', "phstamp"),
+            ]
 
-                # If form fields not found, try a more direct API approach
-                return direct_api_registration(session, email, user_details)
+            for pattern, field_name in field_patterns:
+                match = re.search(pattern, html)
+                if match:
+                    hidden_fields[field_name] = match.group(1)
+                    info(f"[*] Extracted field {field_name}: {match.group(1)[:10]}...")
 
-        # Prepare form data with user details
-        form_data = generate_form_data(user_details, email, "desktop")
+        # Prepare form data with explicit field population - FIX THE POPULATION ISSUE HERE
+        form_data = {}
 
-        # Merge hidden fields with form data
-        form_data.update(hidden_fields)
+        # Add the user information - explicit population
+        form_data["firstname"] = user_details["first_name"]
+        form_data["lastname"] = user_details["last_name"]
+        form_data["reg_email__"] = email
+        form_data["reg_email_confirmation__"] = email
+        form_data["reg_passwd__"] = user_details["password"]
 
-        # Add security tokens - very important for 2025 Facebook
-        form_data = add_security_tokens(form_data, html)
+        # Add birthday fields
+        form_data["birthday_day"] = str(user_details["birthday"].day)
+        form_data["birthday_month"] = str(user_details["birthday"].month)
+        form_data["birthday_year"] = str(user_details["birthday"].year)
 
-        # Generate unique request/submission identifiers
-        request_id = generate_random_string(16)
+        # Add gender (1=female, 2=male)
+        form_data["sex"] = "1" if user_details["gender"] == "F" else "2"
+
+        # Add standard form fields
+        form_data["websubmit"] = "Sign Up"
+        form_data["referrer"] = ""
+        form_data["locale"] = "en_US"
+        form_data["client_id"] = "1"
+        form_data["terms"] = "on"
+        form_data["datause"] = "on"
+        form_data["ns"] = "0"
+        form_data["did_skip"] = "true"
+        form_data["name_suggest_elig"] = "false"
+        form_data["did_use_age"] = "true"
+        form_data["did_choose_custom_gender"] = "false"
+
+        # Add any hidden fields found on the page
+        if hidden_fields:
+            form_data.update(hidden_fields)
+
+        # Add security tokens - critical for Facebook to accept the form
+        if "jazoest" not in form_data:
+            # Generate a proper jazoest token
+            value_to_hash = form_data.get("firstname", "") + form_data.get(
+                "lastname", ""
+            )
+            jazoest_sum = (
+                sum(ord(c) for c in value_to_hash) + 88
+            )  # Facebook's algorithm
+            form_data["jazoest"] = f"2{jazoest_sum}"
+
+        if "lsd" not in form_data:
+            # Generate a realistic LSD token
+            form_data["lsd"] = generate_random_string(10)
+
+        # Generate unique identifiers
         device_id = str(uuid.uuid4()).replace("-", "")
-        user_details["device_id"] = device_id
+        request_id = generate_random_string(16)
+        form_data["reg_instance"] = request_id
         current_time = int(time.time())
 
-        # Add essential fields needed by Facebook's 2025 registration system
-        form_data.update(
-            {
-                "reg_instance": request_id,
-                "submission_request": "true",
-                "encpass": f"#PWD_BROWSER:5:{current_time}:{user_details['password']}",  # Version 5 encryption
-                "ccp": "2",
-                "reg_impression_id": generate_random_string(16),
-                "ns": "0",
-                "app_id": "0",
-                "logger_id": generate_random_string(16),
-                "frontend_env": "prod",
-                "client_mutation_id": str(uuid.uuid4()),
-                # Updated 2025 Facebook terms fields
-                "terms": "on",
-                "datause": "on",
-                "dpr": str(random.choice([1, 1.5, 2, 2.5])),
-                "contactpoint_label": "email",
-                "execution_time": str(
-                    int(time.time() * 1000)
-                    - (int(time.time() * 1000) - random.randint(1500, 4000))
-                ),
-                "websubmit": "Sign Up",
-                # Additional modern Facebook fields
-                "is_headline_shown": "true",
-                "age_step_input": "",
-                "__user": "0",  # Non-logged in user
-                "use_image_protection": "true",
-                "context": "registration",
-                "anti_detection_disabled": "false",
-                # Email verification related flags
-                "skip_email_confirmation": "false",
-                "use_nonce_oauth": "true",
-            }
+        # Add timestamp and encrypted password (Facebook's format)
+        form_data["encpass"] = (
+            f"#PWD_BROWSER:5:{current_time}:{user_details['password']}"
         )
 
-        # Simulate realistic form filling with modern timing patterns
-        form_data = simulate_realistic_form_filling(
-            session, signup_url, form_data, user_details
-        )
-        if not form_data:
-            return False, None
+        # Debug the form data to ensure fields are populated
+        debug_data = {
+            "firstname": form_data.get("firstname", ""),
+            "lastname": form_data.get("lastname", ""),
+            "reg_email__": form_data.get("reg_email__", ""),
+            "birthday": f"{form_data.get('birthday_day', '')}/{form_data.get('birthday_month', '')}/{form_data.get('birthday_year', '')}",
+            "sex": form_data.get("sex", ""),
+        }
+        info(f"[*] Form data to submit: {debug_data}")
 
-        # Set up headers for the form submission with more browser-like behavior
+        # Set up headers for the form submission
         form_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Origin": FB_DESKTOP_URL,
-            "Referer": signup_url,
+            "Referer": reg_url,
             "Cache-Control": "max-age=0",
             "Sec-Fetch-Site": "same-origin",
             "Sec-Fetch-Mode": "navigate",
@@ -289,92 +244,26 @@ def register_facebook_desktop(email, user_details, proxies=None):
             "Sec-Fetch-Dest": "document",
             "Priority": "high",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "X-FB-Friendly-Name": "RegistrationFormSubmitMutation",
-            "X-FB-LSD": form_data.get("lsd", generate_random_string(10)),
-            "X-ASBD-ID": "129477",
-            "X-FB-Client-Context": json.dumps({"deviceId": device_id}),
         }
 
-        # Check if modern GraphQL API is being used
-        is_graphql = "/api/graphql" in submit_url
-
-        if is_graphql:
-            # Modern Facebook uses GraphQL for registration in 2025
-            # Prepare a proper GraphQL request
-            graphql_variables = {
-                "input": {
-                    "firstname": user_details["first_name"],
-                    "lastname": user_details["last_name"],
-                    "email": email,
-                    "email_confirmation": email,
-                    "encrypted_password": form_data["encpass"],
-                    "birthday_day": int(user_details["birthday"].day),
-                    "birthday_month": int(user_details["birthday"].month),
-                    "birthday_year": int(user_details["birthday"].year),
-                    "gender": "1" if user_details["gender"] == "F" else "2",
-                    "registration_instance": form_data["reg_instance"],
-                    "optIntoEmailMarketing": False,
-                    "contactpoint_type": "email",
-                    "client_mutation_id": form_data.get(
-                        "client_mutation_id", str(uuid.uuid4())
-                    ),
-                    "device_id": device_id,
-                    "jazoest": form_data.get("jazoest", ""),
-                    "fb_dtsg": form_data.get("fb_dtsg", ""),
-                    "lsd": form_data.get("lsd", ""),
-                    "form_source": "registration_form",
-                    "source": "registration",
-                }
-            }
-
-            # Build the GraphQL request
-            graphql_data = {
-                "doc_id": "5763936226994235",  # This is the GraphQL document ID for registration
-                "variables": json.dumps(graphql_variables),
-                "fb_dtsg": form_data.get("fb_dtsg", ""),
-                "jazoest": form_data.get("jazoest", ""),
-                "lsd": form_data.get("lsd", ""),
-                "__user": "0",
-                "__a": "1",
-                "__req": generate_random_string(4),
-                "__rev": str(random.randint(1000000, 9999999)),
-            }
-
-            # Use GraphQL form data
-            submission_data = graphql_data
-            form_headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-            info("[*] Using modern GraphQL registration approach")
-        else:
-            # Use standard form submission approach
-            submission_data = form_data
-            debug_data = {
-                k: form_data[k]
-                for k in ["firstname", "lastname", "reg_email__"]
-                if k in form_data
-            }
-            info(f"[*] Submitting form with data: {debug_data}")
-
-        # Step 4: Submit the registration form with modernized approach
-        info("[*] Submitting registration form...")
-
-        # More realistic pre-submission delay
-        wait_with_jitter(0.5, 1.5)
+        # Add a natural delay before submission
+        wait_with_jitter(3.0, 5.0)
 
         # Submit the form
+        info("[*] Submitting registration form...")
         response = session.post(
             submit_url,
-            data=submission_data,
+            data=form_data,
             headers=form_headers,
             allow_redirects=True,
             timeout=TIMEOUT,
         )
 
-        # Step 5: Enhanced result analysis
+        # Debug response
         info(f"[*] Response status: {response.status_code}")
         info(f"[*] Response URL: {response.url}")
 
-        # Debug cookies to check for success indicators
+        # Check cookies for success indicators
         cookies = session.cookies.get_dict()
         cookie_keys = list(cookies.keys())
         cookie_debug = (
@@ -384,195 +273,116 @@ def register_facebook_desktop(email, user_details, proxies=None):
         )
         info(cookie_debug)
 
-        # Modern Facebook often responds with JSON, especially for GraphQL
-        try:
-            json_response = response.json()
-            info("[*] Received JSON response")
-
-            # Check for registration success or redirect in JSON
-            if "location" in json_response:
-                redirect_url = json_response["location"]
-                info(f"[*] Following redirect to: {redirect_url}")
-
-                # Follow the redirect
-                response = session.get(redirect_url, timeout=TIMEOUT)
-                info(f"[*] New response URL: {response.url}")
-
-            # Check for GraphQL response format
-            elif "data" in json_response:
-                graphql_data = json_response.get("data", {})
-                if "registration" in graphql_data:
-                    registration_result = graphql_data["registration"]
-
-                    if registration_result.get("success") is True:
-                        user_id = registration_result.get("userID") or "Unknown"
-                        info(
-                            f"[*] GraphQL registration successful with user ID: {user_id}"
-                        )
-
-                        # Handle success
-                        success(f"[+] Desktop registration successful!")
-                        print_success(email, user_id, user_details)
-                        save_account(email, user_details, user_id)
-                        return True, user_id
-
-                    # Check for error or additional verification needed
-                    elif "error" in registration_result:
-                        error_msg = registration_result["error"].get(
-                            "message", "Unknown error"
-                        )
-                        error(f"[×] GraphQL registration error: {error_msg}")
-
-                    # Check for redirect URL in the GraphQL response
-                    elif "redirectURL" in registration_result:
-                        redirect_url = registration_result["redirectURL"]
-                        info(f"[*] Following GraphQL redirect to: {redirect_url}")
-
-                        # Follow the redirect
-                        response = session.get(redirect_url, timeout=TIMEOUT)
-                        info(f"[*] New response URL: {response.url}")
-
-            # Facebook sometimes returns errors in a specific format
-            elif "error" in json_response:
-                error_data = json_response["error"]
-                error_code = error_data.get("code", 0)
-                error_msg = error_data.get("message", "Unknown error")
-                error(f"[×] API error code {error_code}: {error_msg}")
-
-                # Check for specific error types that require different handling
-                if error_code in [
-                    1357001,
-                    1357003,
-                    1357005,
-                ]:  # Security or rate limit errors
-                    error(
-                        "[×] Security or rate limit triggered - waiting longer before retry"
-                    )
-                    wait_time = random.uniform(10, 15)
-                    info(f"[*] Waiting {wait_time:.1f} seconds before next attempt")
-                    time.sleep(wait_time)
-
-                return False, None
-
-        except ValueError:
-            # Not JSON, continue with normal HTML response flow
-            pass
-
         # Extract a snippet of the response for debugging
         debug_response = (
-            response.text[:300] + "..." if len(response.text) > 300 else response.text
+            response.text[:500] + "..." if len(response.text) > 500 else response.text
         )
-        debug_response = re.sub(r"\s+", " ", debug_response)
-        info(f"[*] Response snippet: {debug_response[:150]}...")
+        info(f"[*] Response content preview: {debug_response[:150]}...")
 
-        # Modern success indicators for 2025
+        # CRITICAL - Check for actual success indicators
+
+        # 1. Check for c_user cookie - this is the most reliable indicator
+        if "c_user" in cookies:
+            user_id = cookies["c_user"]
+            info(f"[+] Found c_user cookie with ID: {user_id}")
+
+            # Generate Facebook profile URL
+            profile_url = f"https://www.facebook.com/profile.php?id={user_id}"
+            user_details["profile_url"] = profile_url
+
+            success(f"[+] Desktop registration successful!")
+            success(f"[+] Profile URL: {profile_url}")
+
+            print_success(email, user_id, user_details)
+            save_account(email, user_details, user_id)
+            return True, user_id
+
+        # 2. Check for confirmation URL indicators
         success_indicators = [
             "confirmemail",
             "checkpoint",
+            "confirmation",
             "welcome",
             "reg_success",
-            "?next=",
-            "home.php",
-            "account_verified",
             "save-device",
-            "login/save-device",
-            "privacy_mutation_token",
-            "c_user",
-            "checkpoint/?next",
-            "verification_method",
-            "registration_confirmation",
-            "registration/submitted/",
-            "confirm_email",
-            "welcome_interstitial",
-            "reg_confirmed",
+            "c_user=",
         ]
 
-        # Check for c_user cookie which indicates successful account creation
-        cookie_success = "c_user" in cookies
-
-        # Check for success in the response
-        is_success = response.status_code in [200, 302] and (
-            any(indicator in response.url for indicator in success_indicators)
-            or cookie_success
-            or any(indicator in response.text for indicator in success_indicators)
-        )
-
-        if is_success:
-            # Extract user ID
+        if any(indicator in response.url for indicator in success_indicators):
+            # Try to extract user ID from URL or content
             user_id = extract_user_id(response, session)
 
-            # Handle success
-            success(f"[+] Desktop registration successful!")
-            print_success(email, user_id, user_details)
-            save_account(email, user_details, user_id)
+            # Only consider valid if we got a real user ID (not "0" or "Unknown")
+            if user_id and user_id not in ["0", "Unknown"]:
+                # Generate Facebook profile URL
+                profile_url = f"https://www.facebook.com/profile.php?id={user_id}"
+                user_details["profile_url"] = profile_url
 
-            # Try to follow up with a confirmation page visit if needed
-            if "confirmemail" in response.url or "checkpoint" in response.url:
-                try:
-                    # Visit the confirmation page to complete the process
-                    confirmation_response = session.get(response.url, timeout=TIMEOUT)
-                    info("[*] Visited confirmation page")
-                except Exception as e:
-                    error(f"[!] Error visiting confirmation page: {e}")
+                success(f"[+] Desktop registration successful via redirect!")
+                success(f"[+] Profile URL: {profile_url}")
 
-            return True, user_id
-        else:
-            # Extract error message
-            error_text = extract_error_message(response.text)
-            error(f"[×] Registration error: {error_text}")
+                print_success(email, user_id, user_details)
+                save_account(email, user_details, user_id)
+                return True, user_id
 
-            # Check for specific blocking messages for better debugging
-            if any(
-                block_term in error_text.lower()
-                or block_term in response.url.lower()
-                or block_term in response.text.lower()
-                for block_term in [
-                    "blocked",
-                    "try again later",
-                    "temporary",
-                    "suspicious",
-                    "too many",
-                    "wait",
-                    "unusual activity",
-                    "security",
-                    "rate limit",
-                    "registration limit",
-                    "too many accounts",
-                    "automated",
-                    "bot",
-                    "captcha",
-                    "verification",
-                ]
-            ):
-                error("[×] Registration blocked by Facebook security measures")
+        # 3. Check for specific success mentions in the HTML
+        success_phrases = [
+            "account created",
+            "registration successful",
+            "welcome to facebook",
+            "check your email",
+            "confirm your email",
+            "sent you an email",
+            "verification link",
+        ]
 
-                # If we think it's rate limiting, wait longer before next attempt
-                if any(
-                    rate_term in error_text.lower()
-                    or rate_term in response.text.lower()
-                    for rate_term in [
-                        "try again later",
-                        "temporary",
-                        "too many",
-                        "wait",
-                        "rate",
-                        "limit",
-                    ]
-                ):
-                    wait_time = random.uniform(8, 15)  # Longer wait for rate limiting
-                    info(f"[*] Rate limiting detected, waiting {wait_time:.1f} seconds")
-                    time.sleep(wait_time)
+        if any(phrase in response.text.lower() for phrase in success_phrases):
+            # Try to extract user ID from response content
+            user_id = extract_user_id(response, session)
 
-            return False, None
+            # Only consider valid if we got a real user ID (not "0" or "Unknown")
+            if user_id and user_id not in ["0", "Unknown"]:
+                # Generate Facebook profile URL
+                profile_url = f"https://www.facebook.com/profile.php?id={user_id}"
+                user_details["profile_url"] = profile_url
+
+                success(f"[+] Desktop registration successful via content match!")
+                success(f"[+] Profile URL: {profile_url}")
+
+                print_success(email, user_id, user_details)
+                save_account(email, user_details, user_id)
+                return True, user_id
+
+        # If we reached here, registration likely failed - check for error messages
+        error_text = extract_error_message(response.text)
+        error(f"[×] Registration error: {error_text}")
+
+        # Improve error messages - don't mention CAPTCHA directly
+        if (
+            "email address that you" in response.text.lower()
+            or "email already in use" in response.text.lower()
+        ):
+            error("[!] Email address is already registered with Facebook")
+        elif "try again later" in response.text.lower():
+            warn(
+                "[!] Facebook is temporarily limiting registrations from this location"
+            )
+        elif "cannot process your request" in response.text.lower():
+            warn("[!] Facebook cannot process the request due to security measures")
+        elif "something went wrong" in response.text.lower():
+            warn("[!] Facebook encountered an issue with this registration")
+
+        return False, None
 
     except requests.exceptions.RequestException as req_err:
         error(f"[×] Network error: {req_err}")
         return False, None
     except Exception as e:
-        error(f"[×] Error: {e}")
+        error(f"[×] Error: {str(e)}")
         return False, None
 
 
+# Helper functions remain the same
 def extract_modern_form_data(html):
     """Extract form data from modern Facebook client-side rendered pages (2025 format)"""
     form_data = {}
@@ -641,194 +451,3 @@ def extract_modern_form_data(html):
         info(f"[*] Error extracting modern form data: {e}")
 
     return form_data
-
-
-def direct_api_registration(session, email, user_details):
-    """Enhanced direct API registration for 2025 Facebook security"""
-    try:
-        info("[*] Using direct API registration method (2025 updated)")
-
-        # Modern Facebook's GraphQL API endpoint for registration
-        api_url = f"{FB_DESKTOP_URL}/api/graphql/"
-
-        # Generate necessary modern tokens
-        request_id = generate_random_string(10)
-        client_mutation_id = str(uuid.uuid4())
-        device_id = user_details.get("device_id", str(uuid.uuid4()).replace("-", ""))
-        timestamp = int(time.time())
-
-        # Modern GraphQL doc_id for registration (2025 version)
-        doc_id = (
-            "5763936226994235"  # This changes periodically, using a recent valid one
-        )
-
-        # Setup GraphQL variables for the registration mutation
-        variables = {
-            "input": {
-                "firstname": user_details["first_name"],
-                "lastname": user_details["last_name"],
-                "email": email,
-                "email_confirmation": email,
-                "encrypted_password": f"#PWD_BROWSER:5:{timestamp}:{user_details['password']}",
-                "birthday_day": int(user_details["birthday"].day),
-                "birthday_month": int(user_details["birthday"].month),
-                "birthday_year": int(user_details["birthday"].year),
-                "gender": "1" if user_details["gender"] == "F" else "2",
-                "registration_instance": generate_random_string(16),
-                "optIntoEmailMarketing": False,
-                "contactpoint_type": "email",
-                "client_mutation_id": client_mutation_id,
-                "device_id": device_id,
-                "create_security_checkpoints": False,
-                "flow_type": "registration",
-                "source": "registration_form",
-            }
-        }
-
-        # Generate a properly formatted jazoest
-        jazoest_base = f"{device_id}{timestamp}"
-        jazoest_sum = sum(ord(c) for c in jazoest_base)
-        jazoest = f"2{jazoest_sum}"
-
-        # Generate a valid fb_dtsg format (2025 pattern)
-        fb_dtsg = f"AQHa{generate_random_string(8)}:{generate_random_string(8)}"
-
-        # Prepare API request data
-        api_data = {
-            "doc_id": doc_id,
-            "variables": json.dumps(variables),
-            "fb_dtsg": fb_dtsg,
-            "jazoest": jazoest,
-            "lsd": generate_random_string(10),
-            "__user": "0",
-            "__a": "1",
-            "__req": request_id[:4],
-            "__rev": str(random.randint(1000000, 9999999)),
-            "__s": generate_random_string(8),
-            "dpr": "1",
-            "__ccg": "EXCELLENT",
-            "__hsi": str(timestamp),
-            "__comet_req": "1",
-            "fb_api_caller_class": "RelayModern",
-            "fb_api_req_friendly_name": "RegistrationFormSubmitMutation",
-            "server_timestamps": "true",
-        }
-
-        # Set modern headers specific to GraphQL API
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": FB_DESKTOP_URL,
-            "Referer": f"{FB_DESKTOP_URL}/r.php",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Dest": "empty",
-            "X-FB-Friendly-Name": "RegistrationFormSubmitMutation",
-            "X-FB-LSD": api_data["lsd"],
-            "X-ASBD-ID": "129477",
-            "X-FB-Connection-Quality": "EXCELLENT",
-            "Priority": "u=1, i",
-            "X-FB-Client-Context": json.dumps({"deviceId": device_id}),
-        }
-
-        # Submit the API request
-        info("[*] Submitting GraphQL registration mutation...")
-        response = session.post(
-            api_url,
-            data=urlencode(api_data),
-            headers=headers,
-            allow_redirects=True,
-            timeout=TIMEOUT,
-        )
-
-        info(f"[*] API response status: {response.status_code}")
-
-        # Check cookies for success
-        cookies = session.cookies.get_dict()
-        if "c_user" in cookies:
-            user_id = cookies["c_user"]
-            success(f"[+] API registration successful!")
-            print_success(email, user_id, user_details)
-            save_account(email, user_details, user_id)
-            return True, user_id
-
-        # Try to parse response as JSON
-        try:
-            result = response.json()
-
-            # Check for GraphQL success response
-            if "data" in result and "registration" in result["data"]:
-                registration_data = result["data"]["registration"]
-
-                if registration_data.get("success") is True:
-                    user_id = registration_data.get("userID", "Unknown")
-                    success(f"[+] GraphQL registration successful!")
-                    print_success(email, user_id, user_details)
-                    save_account(email, user_details, user_id)
-                    return True, user_id
-
-                elif "redirectURL" in registration_data:
-                    # Need to follow a redirect for verification
-                    redirect_url = registration_data["redirectURL"]
-                    info(f"[*] Following redirect to: {redirect_url}")
-
-                    redirect_response = session.get(redirect_url, timeout=TIMEOUT)
-                    if "c_user" in session.cookies.get_dict():
-                        user_id = session.cookies.get_dict()["c_user"]
-                        success(f"[+] Registration successful after redirect!")
-                        print_success(email, user_id, user_details)
-                        save_account(email, user_details, user_id)
-                        return True, user_id
-
-            # Facebook sometimes returns a success indicator or error in other formats
-            if result.get("success") is True:
-                user_id = result.get("userID", "Unknown")
-                success(f"[+] API registration successful!")
-                print_success(email, user_id, user_details)
-                save_account(email, user_details, user_id)
-                return True, user_id
-
-            # Debug the JSON response
-            debug_result = (
-                str(result)[:150] + "..." if len(str(result)) > 150 else str(result)
-            )
-            info(f"[*] API response: {debug_result}")
-
-            # Check for error message in the response
-            if "errors" in result:
-                error_messages = []
-                for err in result["errors"]:
-                    if "message" in err:
-                        error_messages.append(err["message"])
-
-                error_text = "; ".join(error_messages)
-                error(f"[×] GraphQL error: {error_text}")
-
-                # Handle rate limiting specifically
-                if any(
-                    term in error_text.lower()
-                    for term in ["rate", "limit", "wait", "try again"]
-                ):
-                    wait_time = random.uniform(10, 20)
-                    info(f"[*] Rate limiting detected, waiting {wait_time:.1f} seconds")
-                    time.sleep(wait_time)
-
-            elif "error" in result:
-                error_data = result["error"]
-                if isinstance(error_data, dict):
-                    error_msg = error_data.get("message", "Unknown error")
-                    error_code = error_data.get("code", 0)
-                    error(f"[×] API error code {error_code}: {error_msg}")
-                else:
-                    error(f"[×] API error: {error_data}")
-
-        except Exception as e:
-            error(f"[×] Error parsing API response: {e}")
-            info(f"[*] Raw response text: {response.text[:100]}...")
-
-        # If we reach here, API registration failed
-        error(f"[×] API registration failed")
-        return False, None
-
-    except Exception as e:
-        error(f"[×] API registration error: {e}")
-        return False, None

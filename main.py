@@ -9,7 +9,7 @@ import os
 from datetime import datetime
 
 # Import utility modules
-from utils.colors import banner, separator, success, error, info
+from utils.colors import banner, separator, success, error, info, warn
 from utils.proxy import load_proxies, test_proxy, get_random_proxy
 from utils.helpers import wait_with_jitter, generate_browser_fingerprint
 
@@ -50,6 +50,12 @@ def main():
     parser.add_argument(
         "-t", "--timeout", type=int, default=40, help="Request timeout in seconds"
     )
+    parser.add_argument(
+        "--max-wait",
+        type=int,
+        default=0,
+        help="Maximum wait time between attempts (overrides default)",
+    )
 
     args = parser.parse_args()
 
@@ -81,6 +87,13 @@ def main():
         DELAY_BETWEEN_ATTEMPTS = (min_delay + args.delay, max_delay + args.delay)
         info(f"[+] Increased delay between attempts to: {DELAY_BETWEEN_ATTEMPTS}")
 
+    if args.max_wait:
+        from config import DELAY_BETWEEN_ATTEMPTS
+
+        min_delay, _ = DELAY_BETWEEN_ATTEMPTS
+        DELAY_BETWEEN_ATTEMPTS = (min_delay, args.max_wait)
+        info(f"[+] Set maximum delay between attempts to: {args.max_wait}s")
+
     # Check and handle proxy usage
     use_proxies = args.proxy
     if not use_proxies:
@@ -95,9 +108,13 @@ def main():
             info("[*] Testing proxy configuration...")
             proxy = get_random_proxy()
             if proxy:
-                info(
-                    f"[*] Selected proxy for testing: {list(proxy.values())[0].split('@')[-1] if '@' in list(proxy.values())[0] else list(proxy.values())[0]}"
+                proxy_display = list(proxy.values())[0]
+                proxy_display = (
+                    proxy_display.split("@")[-1]
+                    if "@" in proxy_display
+                    else proxy_display
                 )
+                info(f"[*] Selected proxy for testing: {proxy_display}")
                 proxy_works = test_proxy(proxy)
                 if not proxy_works:
                     error("[!] Proxy test failed. You may continue or disable proxies.")
@@ -127,7 +144,11 @@ def main():
 
     # Create a browser fingerprint for this session
     session_fingerprint = generate_browser_fingerprint()
-    info(f"[+] Generated browser fingerprint: {session_fingerprint['platform']} device")
+    # Get platform information safely with a fallback
+    platform = session_fingerprint.get(
+        "platform", session_fingerprint.get("device", {}).get("platform", "Unknown")
+    )
+    info(f"[+] Generated browser fingerprint: {platform} device")
 
     # Record start time for performance tracking
     start_time = time.time()
@@ -169,8 +190,16 @@ def suggest_next_steps(email, user_details):
 
     # Check temp email
     if any(
-        domain in email
-        for domain in ["temp", "tmp", "tempmail", "disposable", "cloudtempmail"]
+        domain in email.lower()
+        for domain in [
+            "temp",
+            "tmp",
+            "tempmail",
+            "disposable",
+            "cloudtempmail",
+            "throwaway",
+            "fake",
+        ]
     ):
         info("[+] → Check your temporary email to confirm the account")
     else:
@@ -179,11 +208,17 @@ def suggest_next_steps(email, user_details):
     # Login suggestion
     info("[+] → Wait 5-10 minutes before logging in for the first time")
     info("[+] → When logging in, use the same browser fingerprint if possible")
+    info("[+] → Use the same IP address when logging in to avoid security checks")
 
     # Account details were saved
     success(f"[+] Account details saved to:")
     info(f"    - Full details: facebook_accounts.txt")
     info(f"    - Login credentials: email_pass.txt")
+
+    # Profile information
+    if "profile_url" in user_details:
+        info(f"[+] Profile URL: {user_details['profile_url']}")
+        info(f"[+] Add friends and content to make your account look legitimate")
 
 
 # Entry point

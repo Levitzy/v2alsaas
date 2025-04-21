@@ -2,6 +2,9 @@
 
 from config import SUCCESS_COLOR, ERROR_COLOR, INFO_COLOR, RESET_COLOR
 
+# Add a warning color (typically yellow/orange)
+WARN_COLOR = "\x1b[38;5;208m"  # Orange color for warnings
+
 
 def success(message):
     """Print a success message"""
@@ -16,6 +19,11 @@ def error(message):
 def info(message):
     """Print an information message"""
     print(f"{INFO_COLOR}{message}{RESET_COLOR}")
+
+
+def warn(message):
+    """Print a warning message"""
+    print(f"{WARN_COLOR}{message}{RESET_COLOR}")
 
 
 def banner():

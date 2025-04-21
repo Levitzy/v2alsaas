@@ -3,6 +3,7 @@
 import os
 import time
 import random
+import requests
 from datetime import datetime
 
 from utils.colors import success, error, info, warn
@@ -13,11 +14,18 @@ from config import ACCOUNTS_PATH, EMAIL_PASS_PATH, MAX_ATTEMPTS
 def save_account(email, user_details, user_id):
     """Save account details to files with improved handling"""
     try:
-        # Format for saving
+        # Create profile URL if not already present
+        if "profile_url" not in user_details:
+            user_details["profile_url"] = (
+                f"https://www.facebook.com/profile.php?id={user_id}"
+            )
+
+        # Format for saving with profile URL
         account_data = (
             f"{email}|{user_details['password']}|{user_id}|"
             f"{user_details['first_name']} {user_details['last_name']}|"
-            f"{user_details['birthday']}|{user_details['gender']}\n"
+            f"{user_details['birthday']}|{user_details['gender']}|"
+            f"{user_details['profile_url']}\n"
         )
 
         # Ensure directory exists
@@ -29,7 +37,9 @@ def save_account(email, user_details, user_id):
 
         # Save just email and password
         with open(EMAIL_PASS_PATH, "a") as f:
-            f.write(f"{email}|{user_details['password']}\n")
+            f.write(
+                f"{email}|{user_details['password']}|{user_id}|{user_details['profile_url']}\n"
+            )
 
         success("[+] Account details saved to files")
         return True
@@ -40,6 +50,12 @@ def save_account(email, user_details, user_id):
 
 def print_success(email, user_id, user_details):
     """Print success message with account details in a stylish format"""
+    # Create profile URL if not already present
+    if "profile_url" not in user_details:
+        user_details["profile_url"] = (
+            f"https://www.facebook.com/profile.php?id={user_id}"
+        )
+
     success(
         f"""
 ⋘▬▭▬▭▬▭▬﴾𓆩ACCOUNT CREATED𓆪﴿▬▭▬▭▬▭▬⋙
@@ -49,6 +65,7 @@ def print_success(email, user_id, user_details):
 ﴾𝐕𝐈𝐏﴿ NAME : {user_details["first_name"]} {user_details["last_name"]}
 ﴾𝐕𝐈𝐏﴿ BIRTHDAY : {user_details["birthday"]} 
 ﴾𝐕𝐈𝐏﴿ GENDER : {user_details["gender"]}
+﴾𝐕𝐈𝐏﴿ PROFILE : {user_details["profile_url"]}
 ⋘▬▭▬▭▬▭▬﴾𓆩ACCOUNT CREATED𓆪﴿▬▭▬▭▬▭▬⋙"""
     )
 
@@ -75,6 +92,8 @@ def print_summary(success_status, email, user_details, start_time):
         success(f"[+] Email: {email}")
         success(f"[+] Password: {user_details['password']}")
         success(f"[+] Name: {user_details['first_name']} {user_details['last_name']}")
+        if "profile_url" in user_details:
+            success(f"[+] Profile URL: {user_details['profile_url']}")
     else:
         error(f"[+] Failed to create account")
         error(f"[+] Facebook may be blocking registration attempts")
@@ -85,6 +104,8 @@ def print_summary(success_status, email, user_details, start_time):
         info(f"    - Use a different IP address or proxy")
         info(f"    - Try different mobile/desktop user agents")
         info(f"    - Increase delay between registration attempts")
+        info(f"    - Use a different email provider")
+        info(f"    - Wait a few hours before trying again")
 
     # Print statistics
     info(f"[+] Time: {elapsed_time:.2f} seconds")
@@ -161,9 +182,8 @@ def create_facebook_account(email, use_proxies, browser_fingerprint=None):
             if browser_fingerprint:
                 user_details.update(browser_fingerprint)
 
-            # Decide on the method to use based on previous attempts
+            # Try desktop method first on first attempt
             if attempt == 0 or "desktop" not in attempted_methods:
-                # Method 1: Desktop registration (try first)
                 info(f"[*] Trying desktop method (1/2)...")
                 try:
                     success_desktop, user_id_desktop = register_facebook_desktop(
@@ -171,7 +191,11 @@ def create_facebook_account(email, use_proxies, browser_fingerprint=None):
                     )
                     attempted_methods.append("desktop")
 
-                    if success_desktop:
+                    if (
+                        success_desktop
+                        and user_id_desktop
+                        and user_id_desktop not in ["0", "Unknown"]
+                    ):
                         # Update proxy status if successful
                         if use_proxies and proxies:
                             update_proxy_status(proxies, True)
@@ -186,8 +210,8 @@ def create_facebook_account(email, use_proxies, browser_fingerprint=None):
             # Add a waiting period between methods
             wait_with_jitter(3.0, 6.0)
 
-            # Method 2: Mobile web method
-            if attempt == 0 or "mobile" not in attempted_methods:
+            # Try mobile method after desktop
+            if "mobile" not in attempted_methods:
                 info(f"[*] Trying mobile method (2/2)...")
                 if use_proxies and attempt > 0:
                     # Rotate proxy for second attempt
@@ -207,7 +231,11 @@ def create_facebook_account(email, use_proxies, browser_fingerprint=None):
                     )
                     attempted_methods.append("mobile")
 
-                    if success_mobile:
+                    if (
+                        success_mobile
+                        and user_id_mobile
+                        and user_id_mobile not in ["0", "Unknown"]
+                    ):
                         # Update proxy status if successful
                         if use_proxies and proxies:
                             update_proxy_status(proxies, True)
@@ -239,3 +267,42 @@ def create_facebook_account(email, use_proxies, browser_fingerprint=None):
 
     error(f"[×] All attempts failed")
     return False, user_details  # Return user details anyway for reference
+
+
+def verify_account_created(user_id, email, password):
+    """Verify the account was actually created by attempting a simple check"""
+    if not user_id or user_id in ["0", "Unknown"]:
+        warn("[!] Invalid user ID, account likely not created successfully")
+        return False
+
+    try:
+        # Create a simple session to check the profile URL
+        session = requests.Session()
+        profile_url = f"https://www.facebook.com/profile.php?id={user_id}"
+
+        # Add realistic headers
+        session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        )
+
+        # Check if profile exists
+        info(f"[*] Verifying profile existence at: {profile_url}")
+        response = session.get(profile_url, timeout=10)
+
+        # Look for indicators that the profile exists
+        if response.status_code == 200 and user_id in response.text:
+            success(f"[+] Account verified - profile page exists")
+            return True
+        else:
+            warn(
+                f"[!] Profile verification failed - page may not exist yet or requires login"
+            )
+            return False
+
+    except Exception as e:
+        warn(f"[!] Error during account verification: {e}")
+        return False
