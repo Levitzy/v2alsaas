@@ -339,4 +339,4 @@ def simulate_realistic_form_filling(session, form_url, form_data, user_details):
 
     except Exception as e:
         error(f"[!] Error in form filling simulation: {e}")
-        return form_data  # Return original form data as fallback
+        return form_data
